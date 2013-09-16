@@ -40,7 +40,7 @@
 -author('emmiller@gmail.com').
 -author('Andreas Stenius <kaos@astekk.se>').
 
--export([scan/1, resume/1]).
+-export([scan/1, resume/1, next/2]).
 -include("erlydtl_ext.hrl").
 
 -compile({no_auto_import, [is_number/1]}).
@@ -56,48 +56,42 @@
 %%====================================================================
 
 scan(Template) ->
-    do_scan({fun open_tag/1,
-             #scanner_state{ 
-                template=Template,
-                scope=[#tag{ tag=text, on_scan=fun scan_text/1 }],
-                tags=tags()
-               }}).
+    do_scan(
+      #scanner_state{ 
+         template=Template,
+         scope=[],
+         tags=tags()
+        }).
 
 resume(State) when is_record(State, scanner_state) ->
-    do_scan({fun open_tag/1, State}).
+    do_scan(State).
 
 %%====================================================================
 %% Internal functions
 %%====================================================================
 
-do_scan({_, #scanner_state{ template=[] }=State}) ->
+-record(scope, {
+          pos=1 :: integer(),
+          until :: Pos::pos_integer(),
+          tag :: #tag{},
+          tags=[] :: {{Pos::pos_integer(), Prio::any()}, list(#tag{})}
+         }).
+
+do_scan(#scanner_state{ template=[] }=State) ->
     #scanner_state{ scanned=Scanned } = scan_token(reverse_string, State),
     {ok, lists:reverse(Scanned)};
-do_scan({Next, State}) when is_function(Next, 1)-> do_scan(Next(State));
+do_scan(#scanner_state{ scope=[#scope{ pos=Pos, tags=[{{Pos, _}, Tag}|_] }|_] }=State) ->
+    do_scan(open_tag(Tag, State));
+do_scan(#scanner_state{ scope=[], tags=Tags }=State) ->
+    do_scan(
+      open_tag(
+        find_open_tag(State, [T || T <- Tags, T#tag.valid_in == undefined]),
+        State));
+do_scan(#scanner_state{ scope=[#scope{ until=Pos, pos=Pos }|_] }=State) ->
+    do_scan(close_tag(State));
+do_scan(#scanner_state{ scope=[#scope{ tag=#tag{ on_scan=Scan } }|_] }=State) ->
+    do_scan(scan_tag(Scan, State));
 do_scan(Err) -> Err.
-
-
-%%% Main scanner processing states
-
-open_tag(#scanner_state{ scope=[#tag{ tag=In }|_], tags=Tags }=State) ->
-    case find_open_tag(State, [T || T <- Tags, T#tag.valid_in == In]) of
-        undefined -> {fun close_tag/1, State};
-        Tag -> {fun open_tag/1, do_open_tag(Tag, State)}
-    end.
-
-close_tag(#scanner_state{ scope=[#tag{ close=undefined }|_] }=State) ->
-    {fun scan_tag/1, State};
-close_tag(#scanner_state{ template=Template, scope=[T|_] }=State) ->
-    case lists:prefix(T#tag.close, Template) of
-        true -> {fun open_tag/1, do_close_tag(State)};
-        false -> {fun scan_tag/1, State}
-    end.
-
-scan_tag(#scanner_state{ scope=[#tag{ on_scan=Scan }|_] }=State) ->
-    case do_scan_tag(Scan, State) of
-        State1 when is_record(State1, scanner_state) -> {fun open_tag/1, State1};
-        Err -> Err
-    end.
 
 
 %%% State processing helpers
@@ -114,19 +108,66 @@ find_open_tag(#scanner_state{ template=Template }=State, Tags) ->
         [] -> undefined
     end.
 
-do_open_tag(#tag{ open=Prefix, on_open=Open }=Tag,
-            #scanner_state{ scope=Scope }=State) ->
-    move(Prefix, scan_token(Open, State#scanner_state{ scope=[Tag|Scope] })).
+open_tag(#tag{ open=Prefix, on_open=Open }=Tag, State) ->
+    new_scope(Tag, next(Prefix, scan_token(Open, State))).
 
-do_close_tag(#scanner_state{ scope=[#tag{ close=Prefix, 
-                                  on_close=Close }
-                            |Scope] }=State) ->
-    move(Prefix, scan_token(Close, State#scanner_state{ scope=Scope })).
+new_scope(#tag{ tag=In }=Tag, #scanner_state{ tags=Tags, scope=Scope }=State) ->
+    State#scanner_state{
+      scope=[update_scope(
+               #scope{ tag=Tag,
+                       tags=[{{0, 0}, T} || T <- Tags, T#tag.valid_in == In]
+                     },
+               State)
+             |Scope]}.
 
-do_scan_tag(undefined, #scanner_state{ template=[C|_] }=State) -> move(C, State);
-do_scan_tag(OnScan, #scanner_state{ template=[C|_] }=State)
+update_scope(#scope{ pos=Pos, tag=#tag{ close=Close }, tags=Tags }=Scope, State) ->
+    case find_tag(Close, {Pos - 1, undefined}, State) of
+        Pos -> Scope#scope{ until=Pos };
+        Until ->
+            Scope#scope{
+              until=Until,
+              tags=lists:keysort(
+                     1, [case Tag of
+                             {{TagPos, _}, T}
+                               when TagPos < Pos;
+                                    TagPos == undefined ->
+                                 scope_tag(T, Pos, Until, State);
+                             _ -> Tag
+                         end || Tag <- Tags])}
+    end.
+
+scope_tag(#tag{ open=Open, prio=Prio }=Tag, Pos, Until, State) ->
+    {{find_tag(Open, {Pos - 1, Until}, State), Prio}, Tag}.
+
+find_tag(undefined, _, _) -> undefined;
+find_tag(Delim, {Offset, undefined}, #scanner_state{ template=Template }=State) ->
+    tag_pos(Offset, find_tag(Delim, Template, State));
+find_tag(Delim, {Offset, Until}, #scanner_state{ template=Template }=State) ->
+    tag_pos(Offset,
+            find_tag(Delim,
+                     string:substr(Template, 1, Until - Offset),
+                     State));
+find_tag(Delim, String, _State) when is_list(Delim) ->
+    string:str(String, Delim);
+find_tag(Delim, String, State) when is_function(Delim, 2) ->
+    Delim({find, String}, State).
+
+tag_pos(Offset, Pos) when is_integer(Pos), Pos > 0 -> Offset + Pos;
+tag_pos(_Offset, _Pos) -> undefined.
+
+close_tag(#scanner_state{
+                scope=[#scope{
+                          tag=#tag{ 
+                                 close=Prefix,
+                                 on_close=Close } }|_] }=State) ->
+    State1 = next(Prefix, scan_token(Close, State)),
+    [#scope{ pos=Pos }, Scope|Scopes] = State1#scanner_state.scope,
+    State1#scanner_state{ scope=[update_scope(move_scope(Pos - 1, Scope), State1)|Scopes] }.
+
+scan_tag(undefined, #scanner_state{ template=[C|_] }=State) -> next(C, State);
+scan_tag(OnScan, #scanner_state{ template=[C|_] }=State)
   when is_function(OnScan, 2) -> OnScan(C, State);
-do_scan_tag(OnScan, State) when is_function(OnScan, 1) -> OnScan(State).
+scan_tag(OnScan, State) when is_function(OnScan, 1) -> OnScan(State).
 
 
 %%% Save/process scanned token
@@ -155,26 +196,31 @@ scan_token(Type, #scanner_state{ template=[C|_], pos=Pos, scanned=Scanned }=Stat
     State#scanner_state{ scanned=[{Type, Pos, [C]}|Scanned] }.
 
 %%% Move along past processed data in the template
-move([C|Cs], State) -> move(Cs, move(C, State));
-move([], State) -> State;
-move(F, State) when is_function(F, 2) -> F(open, State);
-move(undefined, State) -> State;
-move(C, #scanner_state{ template=[C|Template], pos=Pos }=State) -> 
-    State#scanner_state{ template=Template, pos=update_pos(C, Pos) };
-move(Count, #scanner_state{ template=[C|_] }=State) when Count > 0 ->
-    move(Count - 1, move(C, State));
-move(0, State) -> State.
-
+next([C|Cs], State) -> next(Cs, next(C, State));
+next([], State) -> State;
+next(F, State) when is_function(F, 2) -> F(open, State);
+next(undefined, State) -> State;
+next(C, #scanner_state{ template=[C|Template], pos=Pos, scope=[Scope|Scopes] }=State) -> 
+    State#scanner_state{
+      template=Template,
+      pos=update_pos(C, Pos),
+      scope=[move_scope(1, Scope)|Scopes] };
+next(Count, #scanner_state{ template=[C|_] }=State) when Count > 0 ->
+    next(Count - 1, next(C, State));
+next(0, State) -> State.
 
 %%% Keep track of our position in the template
 update_pos($\n, {Row, _Col}) -> {Row + 1, 1};
 update_pos(_, {Row, Col}) -> {Row, Col + 1}.
 
+move_scope(Count, #scope{ pos=Pos }=Scope) ->
+    Scope#scope{ pos=Pos + Count }.
+
 %%% Add more data to a scanned token
 append_char(C, Type, #scanner_state{ scanned=[{Type, Pos, Chars}|Scanned] }=State) ->
-    move(C, State#scanner_state{ scanned=[{Type, Pos, [C|Chars]}|Scanned] });
+    next(C, State#scanner_state{ scanned=[{Type, Pos, [C|Chars]}|Scanned] });
 append_char(C, Type, #scanner_state{ pos=Pos, scanned=Scanned }=State) ->
-    move(C, State#scanner_state{ scanned=[{Type, Pos, [C]}|Scanned] }).
+    next(C, State#scanner_state{ scanned=[{Type, Pos, [C]}|Scanned] }).
 
 append_next(Type, #scanner_state{ template=[C|_] }=State) -> append_char(C, Type, State).
 append_text(Text, Type, State) ->
@@ -195,8 +241,8 @@ scan_code(#scanner_state{ template=Template }=State) ->
         undefined ->
             {Row, Col} = State#scanner_state.pos,
             {error, {Row, ?MODULE, lists:concat(["Illegal character in column ", Col])}, State};
-        {Cs, skip} -> move(Cs, State);
-        Cs -> move(Cs, scan_token({list_to_atom(Cs), no_value}, State))
+        {Cs, skip} -> next(Cs, State);
+        Cs -> next(Cs, scan_token({list_to_atom(Cs), no_value}, State))
     end.
 
 scan_next_code(Template) ->
@@ -221,23 +267,30 @@ scan_string(State) ->
     append_next(string_literal, State).
 
 scan_escape(State) ->
-    do_close_tag(append_next(string_literal, State)).
+    close_tag(append_next(string_literal, State)).
 
 %% IDENTIFIER
 scan_identifier(C, State) ->
     case is_alpha(C) orelse is_digit(C) of
         true -> append_char(C, identifier, State);
-        false -> do_close_tag(State)
+        false -> close_tag(State)
     end.
 
 is_alpha(C) -> ((C >= $a) andalso (C =< $z)) orelse ((C >= $A) andalso (C =< $Z)) orelse (C == $_).
 is_digit(C) -> (C >= $0) andalso (C =< $9).
 
-is_identifier(test, #scanner_state{ template=T }) -> is_identifier(T);
-is_identifier(open, State) -> move(1, State).
+is_identifier({find, String}, _State) -> find_identifier(String, 1);
+is_identifier(open, State) -> next(1, State).
 
 is_identifier([$_, $(|_]) -> false;
 is_identifier([C|_]) -> is_alpha(C).
+
+find_identifier([], _) -> 0;
+find_identifier(String, Pos) ->
+    case is_identifier(String) of
+        true -> Pos;
+        false -> find_identifier(tl(String), Pos + 1)
+    end.
 
 process_identifier({identifier, Pos, Name}, #scanner_state{ scanned=[_, PrevToken|_] }) ->
     case lists:keyfind(Name, 2, keywords(element(1, PrevToken))) of
@@ -249,14 +302,20 @@ process_identifier({identifier, Pos, Name}, #scanner_state{ scanned=[_, PrevToke
 scan_number(C, State) ->
     case is_digit(C) of
         true -> append_char(C, number_literal, State);
-        false -> do_close_tag(State)
+        false -> close_tag(State)
     end.
 
-is_number(test, #scanner_state{ template=T }) -> is_number(T);
-is_number(open, State) -> move(1, State).
+is_number({find, String}, _State) -> find_number(String, 1);
+is_number(open, State) -> next(1, State).
 
 is_number([C|_]) -> is_digit(C) orelse (C == $-).
 
+find_number([], _) -> 0;
+find_number(String, Pos) ->
+    case is_number(String) of
+        true -> Pos;
+        false -> find_number(tl(String), Pos + 1)
+    end.
 
 %% VERBATIM
 scan_verbatim(#scanner_state{ template=Template,
@@ -264,7 +323,7 @@ scan_verbatim(#scanner_state{ template=Template,
                                        |Scanned]}=State) ->
     case find_end_verbatim(Tag, Template) of
         {true, Cs} ->
-            move(Cs, do_close_tag(
+            next(Cs, close_tag(
                        State#scanner_state{
                          scanned=[{string, Pos, Text}|drop_verbatim_tag(Scanned)]
                         }));
@@ -274,8 +333,10 @@ scan_verbatim(#scanner_state{ template=Template,
             append_text(Cs, Type, State)
     end.
 
-is_verbatim(test, #scanner_state{ scanned=Scanned }) ->
-    find_verbatim_tag(Scanned) /= undefined;
+is_verbatim({find, _}, #scanner_state{ scanned=Scanned }) ->
+    case find_verbatim_tag(Scanned) of
+        undefined -> 0; _ -> 1
+    end;
 is_verbatim(open, State) -> State.
 
 on_verbatim({verbatim, Pos, Text}, #scanner_state{ scanned=[_|Scanned] }) ->
@@ -386,7 +447,9 @@ keywords() ->
 
 %%% Builtin top level block tags and classes..
 tags() ->
-    [#tag{ valid_in=text, tag=verbatim, open=fun is_verbatim/2,
+    [#tag{ tag=text, open="", on_scan=fun scan_text/1 },
+     #tag{ valid_in=text, tag=verbatim, prio=1,
+           open=fun is_verbatim/2,
            on_open=[{verbatim, []}, fun on_verbatim/2],
            on_scan=fun scan_verbatim/1 },
      #tag{ valid_in=text, tag=comment, open="<!--{#", close="#}-->" },

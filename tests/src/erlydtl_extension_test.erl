@@ -4,13 +4,11 @@
 -include("erlydtl_ext.hrl").
 
 %% look for a foo identifer followed by a #
-scan(#scanner_state{ template="#" ++ T, 
-		     scanned=[{identifier, Loc, foo}|Scanned], 
-		     pos={L,C} }=S) ->
+scan(#scanner_state{ template=[$#|_], 
+                     scanned=[{identifier, Loc, foo}|Scanned]
+                   }=S) ->
     %% return new state with the hash dropped, and the foo identifer replaced with bar
-    {ok, S#scanner_state{ template=T,
-			  scanned=[{identifier, Loc, bar}|Scanned],
-			  pos={L, C+1} }};
+    {ok, erlydtl_scanner:next($#, S#scanner_state{ scanned=[{identifier, Loc, bar}|Scanned] })};
 scan(#scanner_state{ template="#" ++ _T, pos={L, C} }) ->
     %% give error when # not follows foo
     {error, {L,?MODULE,lists:concat(["Unexpected '#' in code at column ", C])}};
